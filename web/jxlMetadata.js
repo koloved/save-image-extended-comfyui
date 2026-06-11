@@ -41,19 +41,13 @@ function isJxlContainer(buffer) {
   );
 }
 
-function isAvifContainer(buffer) {
-  if (buffer.byteLength < 16) return false;
-  var boxes = parseBoxes(buffer);
-  for (var i = 0; i < boxes.length; i++) {
-    if (boxes[i].type === "ftyp") {
-      var brandStr = bytesToString(boxes[i].data);
-      return brandStr.indexOf("avif") !== -1;
-    }
-  }
-  return false;
-}
-
 // ── Brotli Decompression ────────────────────────────────────────────────
+// NOTE: Brotli DecompressionStream is NOT available in Chromium/Chrome.
+// It is supported in Firefox and Safari.
+// The server-side fallback route (/api/jxl_metadata) handles cases where
+// client-side brotli decompression is unavailable.
+// Once Chromium ships native Brotli DecompressionStream support,
+// the server fallback path can be removed.
 
 var _brotliFormats = [];
 function detectBrotliFormat() {
@@ -96,7 +90,7 @@ async function decompressBrotli(compressed) {
 
 // ── Metadata Extraction ─────────────────────────────────────────────────
 
-async function getMetadataFromBuffer(buffer) {
+async function getWorkflowFromBuffer(buffer) {
   var boxes = parseBoxes(buffer);
   for (var i = 0; i < boxes.length; i++) {
     if (boxes[i].type === "brob") {
@@ -117,14 +111,14 @@ async function getMetadataFromBuffer(buffer) {
   return null;
 }
 
-async function getMetadataFromFile(file) {
+async function getWorkflowFromFile(file) {
   try {
     var buffer = await file.arrayBuffer();
-    return await getMetadataFromBuffer(buffer);
+    return await getWorkflowFromBuffer(buffer);
   } catch (e) { return null; }
 }
 
-async function getMetadataFromServer(file) {
+async function getWorkflowFromServer(file) {
   try {
     var resp = await api.fetchApi("/jxl_metadata", {
       method: "POST",
@@ -136,7 +130,25 @@ async function getMetadataFromServer(file) {
   } catch (e) { return null; }
 }
 
+// ── Try to load workflow from .jxl / .avif metadata ─────────────────────
+// Returns true if workflow was loaded, false to fall through to default.
+
+async function tryLoadWorkflow(file) {
+  var meta = await getWorkflowFromFile(file);
+  if (!meta) { meta = await getWorkflowFromServer(file); }
+  if (meta && meta.workflow) {
+    var name = file.name.replace(/\.\w+$/, "");
+    var wf = typeof meta.workflow === "string" ? JSON.parse(meta.workflow) : meta.workflow;
+    if (wf && typeof wf === "object") {
+      await app.loadGraphData(wf, true, true, name, {});
+      return true;
+    }
+  }
+  return false;
+}
+
 var _supportedExts = [".jxl", ".avif"];
+var _unpatchedHandleFile = null;
 
 // ── Register Extension ─────────────────────────────────────────────────
 
@@ -149,63 +161,43 @@ app.registerExtension({
 });
 
 // ── Patch app.handleFile ────────────────────────────────────────────────
+// Only loads workflow from embedded metadata.
+// Falls through to default ComfyUI handler for all other cases (image load).
 
 function patchHandleFile() {
   if (typeof app.handleFile !== "function") return;
   if (app._sieJxlAvifPatched) return;
   app._sieJxlAvifPatched = true;
 
-  var orig = app.handleFile.bind(app);
+  _unpatchedHandleFile = app.handleFile.bind(app);
   app.handleFile = async function (file, source, opts) {
-    if (file && file.name) {
-      var lower = file.name.toLowerCase();
-      var isSupported = false;
-      for (var i = 0; i < _supportedExts.length; i++) {
-        if (lower.endsWith(_supportedExts[i])) { isSupported = true; break; }
-      }
-      if (isSupported) {
-        var meta = await getMetadataFromFile(file);
-        if (!meta) { meta = await getMetadataFromServer(file); }
-        if (meta) {
-          var name = file.name.replace(/\.\w+$/, "");
-          if (meta.workflow) {
-            var wf = typeof meta.workflow === "string" ? JSON.parse(meta.workflow) : meta.workflow;
-            if (wf && typeof wf === "object") {
-              await app.loadGraphData(wf, true, true, name, {});
-              return;
-            }
-          }
-          if (meta.prompt) {
-            var p = typeof meta.prompt === "string" ? JSON.parse(meta.prompt) : meta.prompt;
-            if (p && app.isApiJson(p)) {
-              app.loadApiJson(p, name);
-              return;
-            }
-          }
-        }
-      }
+    if (file && file.name && _matchesExt(file.name)) {
+      if (await tryLoadWorkflow(file)) return;
     }
-    return orig(file, source, opts);
+    return _unpatchedHandleFile(file, source, opts);
   };
 }
 
-// ── Capture-phase drop interceptor ──────────────────────────────────────
+function _matchesExt(name) {
+  var lower = name.toLowerCase();
+  for (var i = 0; i < _supportedExts.length; i++) {
+    if (lower.endsWith(_supportedExts[i])) return true;
+  }
+  return false;
+}
+
+// ── Drag/drop interceptors ──────────────────────────────────────────────
+// Allow .jxl/.avif files to be dropped (browser would otherwise reject them).
 
 document.addEventListener("dragover", function (e) {
   try {
     var dt = e.dataTransfer;
     if (!dt || !dt.files) return;
     for (var i = 0; i < dt.files.length; i++) {
-      var name = dt.files[i].name;
-      if (name) {
-        var lower = name.toLowerCase();
-        for (var j = 0; j < _supportedExts.length; j++) {
-          if (lower.endsWith(_supportedExts[j])) {
-            e.preventDefault();
-            e.stopPropagation();
-            return;
-          }
-        }
+      if (dt.files[i].name && _matchesExt(dt.files[i].name)) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
       }
     }
   } catch (ex) {}
@@ -217,31 +209,13 @@ document.addEventListener("drop", function (e) {
     if (!dt || !dt.files) return;
     for (var i = 0; i < dt.files.length; i++) {
       var f = dt.files[i];
-      if (!f || !f.name) continue;
-      var lower = f.name.toLowerCase();
-      var isSupported = false;
-      for (var j = 0; j < _supportedExts.length; j++) {
-        if (lower.endsWith(_supportedExts[j])) { isSupported = true; break; }
-      }
-      if (!isSupported) continue;
+      if (!f || !f.name || !_matchesExt(f.name)) continue;
 
       e.preventDefault();
       e.stopPropagation();
       (async function () {
-        var meta = await getMetadataFromFile(f);
-        if (!meta) { meta = await getMetadataFromServer(f); }
-        if (meta) {
-          if (meta.workflow) {
-            var wf = typeof meta.workflow === "string" ? JSON.parse(meta.workflow) : meta.workflow;
-            if (wf && typeof wf === "object") {
-              await app.loadGraphData(wf, true, true, f.name.replace(/\.\w+$/, ""), {});
-              return;
-            }
-          }
-          if (meta.prompt) {
-            var p = typeof meta.prompt === "string" ? JSON.parse(meta.prompt) : meta.prompt;
-            if (p && app.isApiJson(p)) { app.loadApiJson(p, f.name.replace(/\.\w+$/, "")); }
-          }
+        if (!(await tryLoadWorkflow(f)) && _unpatchedHandleFile) {
+          _unpatchedHandleFile(f, 'client', {});
         }
       })();
       return;
