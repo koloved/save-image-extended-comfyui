@@ -78,7 +78,7 @@ def _find_box(boxes: list[dict], box_type: bytes):
 def _compress_metadata(data: bytes) -> bytes | None:
     if not _BROTLI_AVAILABLE:
         return None
-    return brotli.compress(data)
+    return brotli.compress(data, mode=brotli.MODE_TEXT, quality=11)
 
 
 def _decompress_metadata(data: bytes) -> bytes | None:
@@ -263,6 +263,8 @@ def encode_avif_with_metadata(
     quality: int = 90,
     prompt: dict | None = None,
     extra_pnginfo: dict | None = None,
+    speed: int = 6,
+    numthreads: int = 4,
 ) -> bytes:
     """Encode a numpy image (HxWxC, uint8) to an AVIF file with compressed metadata.
 
@@ -274,9 +276,9 @@ def encode_avif_with_metadata(
         )
 
     if quality >= 100:
-        data = imagecodecs.avif_encode(image, level=100)
+        data = imagecodecs.avif_encode(image, level=100, speed=speed, numthreads=numthreads)
     else:
-        data = imagecodecs.avif_encode(image, level=quality)
+        data = imagecodecs.avif_encode(image, level=quality, speed=speed, numthreads=numthreads)
 
     if prompt is not None or extra_pnginfo is not None:
         raw_meta = _build_metadata_blob(prompt, extra_pnginfo)
