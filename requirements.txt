@@ -6,4 +6,4 @@ imagecodecs
 pillow
 pillow-avif-plugin
 pillow-jxl-plugin
-brotli
+brotli>=1.2.0
